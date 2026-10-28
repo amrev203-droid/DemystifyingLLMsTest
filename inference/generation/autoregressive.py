@@ -2,7 +2,7 @@
 import torch
 from typing import Optional, Callable, Union, Iterable
 from .kv_cache import KVCache
-from .stop_criteria import StopCriteria
+from .stop_criteria import StopCriteria, normalize_eos_token_ids
 
 
 def autoregressive_generate(
@@ -19,9 +19,22 @@ def autoregressive_generate(
     """
     if max_new_tokens < 0:
         raise ValueError(f"max_new_tokens must be non-negative, got {max_new_tokens}")
+    if input_ids.dim() != 2:
+        raise ValueError(f"input_ids must have shape (batch_size, seq_len), got {tuple(input_ids.shape)}")
     generated = input_ids.clone()
     batch_size = generated.size(0)
-    stop_criteria = StopCriteria(max_length=generated.size(1) + max_new_tokens, eos_token_id=eos_token_id)
+    if max_new_tokens > 0 and (batch_size == 0 or generated.size(1) == 0):
+        raise ValueError("input_ids must contain at least one sequence and one token")
+    eos_ids = normalize_eos_token_ids(eos_token_id)
+    stop_criteria = StopCriteria(max_length=generated.size(1) + max_new_tokens, eos_token_id=eos_ids)
+    eos_tensor = torch.tensor(list(eos_ids), dtype=torch.long, device=generated.device) if eos_ids else None
+    finished = (
+        torch.isin(generated[:, -1], eos_tensor)
+        if eos_tensor is not None and generated.size(1) > 0
+        else torch.zeros(batch_size, dtype=torch.bool, device=generated.device)
+    )
+    if max_new_tokens == 0 or (batch_size > 0 and finished.all()):
+        return generated
 
     if use_cache:
         config = getattr(model, "config", None)
@@ -50,18 +63,20 @@ def autoregressive_generate(
         if next_token.dim() == 1:
             next_token = next_token.unsqueeze(-1)
 
+        if eos_tensor is not None:
+            just_finished = torch.isin(next_token.squeeze(-1), eos_tensor)
+            if finished.any():
+                # Keep completed rows at EOS while the remaining rows continue.
+                next_token = torch.where(finished.unsqueeze(-1), generated[:, -1:], next_token)
+                just_finished = just_finished | finished
+            finished = finished | just_finished
+
         generated = torch.cat([generated, next_token], dim=-1)
 
         last_id = next_token[0, 0].item() if batch_size == 1 else None
         if stop_criteria.should_stop(generated.size(1), last_id):
             break
-        eos_ids = (
-            set(eos_token_id) if isinstance(eos_token_id, (list, tuple, set))
-            else ({eos_token_id} if eos_token_id is not None else set())
-        )
-        if batch_size > 1 and eos_ids and torch.isin(
-            next_token, torch.tensor(list(eos_ids), device=next_token.device)
-        ).all():
+        if batch_size > 1 and finished.all():
             break
 
     return generated

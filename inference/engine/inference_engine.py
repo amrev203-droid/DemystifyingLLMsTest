@@ -10,6 +10,7 @@ import torch.nn as nn
 from config.model_config import ModelConfig
 from config.inference_config import InferenceConfig
 from inference.generation.autoregressive import autoregressive_generate
+from inference.generation.beam_search import BeamSearch
 from inference.sampling.sampler import Sampler
 from utils.logging_utils import get_logger
 
@@ -118,6 +119,19 @@ class InferenceEngine:
         if not prompt_tokens:
             raise ValueError("prompt_tokens must contain at least one token")
 
+        input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
+        stop_ids = self.inference_config.stop_token_ids
+        if self.inference_config.beam_width > 1:
+            search = BeamSearch(
+                beam_width=self.inference_config.beam_width,
+                max_length=max_tokens,
+                eos_token_id=stop_ids or None,
+                early_stopping=self.inference_config.early_stopping,
+            )
+            with torch.no_grad():
+                output = search.search(self.model, input_tensor)
+            return output[0].tolist()
+
         temperature_value = temperature if temperature is not None else self.inference_config.temperature
         sampler = Sampler(
             temperature=temperature_value,
@@ -139,8 +153,6 @@ class InferenceEngine:
             history.append(int(next_ids[0].item()))
             return next_ids
 
-        input_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=self.device)
-        stop_ids = self.inference_config.stop_token_ids
         model_forward = getattr(self.model, "forward", self.model)
         try:
             forward_parameters = inspect.signature(model_forward).parameters.values()
